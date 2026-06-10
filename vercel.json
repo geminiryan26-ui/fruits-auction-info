@@ -1,10 +1,1 @@
-{
-  "buildCommand": "vite build",
-  "outputDirectory": "dist",
-  "framework": "vite",
-  "functions": {
-    "api/*.js": {
-      "maxDuration": 15
-    }
-  }
-}
+{}
