@@ -33,7 +33,7 @@ Vercel Dashboard → 프로젝트 선택 → **Settings** → **Environment Vari
 
 | Name | Value |
 |------|-------|
-| `SEOUL_API_KEY` | `625968486568797537336561714e75` (본인 인증키) |
+| `SEOUL_API_KEY` | `xxxxxxxxxxxxxx` (본인 인증키) |
 
 저장 후 **Deployments** 탭에서 **Redeploy** 클릭.
 
