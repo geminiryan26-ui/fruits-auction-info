@@ -5,8 +5,7 @@ import {
 } from "recharts";
 
 /* ═══════════════════════════════════════════════════
-   API 설정 — 모든 요청은 Vercel 서버리스 함수 경유
-   API 키는 서버(환경변수)에만 존재, 클라이언트 미노출
+   서비스명 후보
 ═══════════════════════════════════════════════════ */
 const SERVICE_CANDIDATES = [
   "NMR_AUCT_DTL_INFO",
@@ -14,6 +13,9 @@ const SERVICE_CANDIDATES = [
   "MwmtAuctnInfoSvc",
 ];
 
+/* ═══════════════════════════════════════════════════
+   API helpers
+═══════════════════════════════════════════════════ */
 async function fetchCatalog() {
   const res = await fetch("/api/catalog?id=OA-2662", { signal: AbortSignal.timeout(8000) });
   if (!res.ok) throw new Error(`catalog HTTP ${res.status}`);
@@ -24,20 +26,27 @@ async function fetchCatalog() {
 
 async function fetchAuction(svc, date, signal) {
   const res = await fetch(`/api/auction?svc=${encodeURIComponent(svc)}&date=${date}`, { signal });
+  const json = await res.json();
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw Object.assign(new Error(body.error || `HTTP ${res.status}`), {
-      apiKeyMissing: res.status === 500 && body.hint,
-      apiError: res.status === 400,
+    throw Object.assign(new Error(json.error || `HTTP ${res.status}`), {
+      apiKeyMissing: res.status === 500 && !!json.hint,
+      apiError: res.status === 422,
     });
   }
-  const json = await res.json();
-  const topKey = Object.keys(json)[0] ?? "";
-  const result = json?.[topKey]?.RESULT;
+  const topKey = json.topKey ?? Object.keys(json)[0] ?? "";
+  const result = json.result ?? json?.[topKey]?.RESULT;
   if (result?.CODE && result.CODE !== "INFO-000") {
     throw Object.assign(new Error(`[${result.CODE}] ${result.MESSAGE}`), { apiError: true });
   }
-  return json?.[topKey]?.row ?? [];
+  return json.rows ?? json?.[topKey]?.row ?? [];
+}
+
+// 디버그: 원본 응답 구조 조회
+async function fetchDebug(svc, date) {
+  const today = new Date();
+  const ymd = date ?? `${today.getFullYear()}${String(today.getMonth()+1).padStart(2,"0")}${String(today.getDate()).padStart(2,"0")}`;
+  const res = await fetch(`/api/auction?svc=${encodeURIComponent(svc)}&date=${ymd}&debug=1`);
+  return res.json();
 }
 
 /* ═══════════════════════════════════════════════════
@@ -61,28 +70,50 @@ function buildDates(days) {
 }
 
 /* ═══════════════════════════════════════════════════
-   집계
+   집계 — fieldMap을 통해 실제 필드명 유연하게 처리
 ═══════════════════════════════════════════════════ */
-function aggregate(rows, fruitName, marketId, keywords, dateLabel, dateFull) {
+function detectFields(sampleRow) {
+  // 실제 응답 필드명을 자동 감지
+  const keys = Object.keys(sampleRow).map(k => k.toUpperCase());
+  const find = (...candidates) =>
+    Object.keys(sampleRow).find(k => candidates.includes(k.toUpperCase())) ?? null;
+  return {
+    mid:    find("MID_CLASS_NM","CLSF_NM","ITEM_NM","GOODS_NM","PDLT_NM"),
+    corp:   find("CORP_ITEM_NM","SMALL_CLASS_NM","SCLSF_NM","GOODS_CLSF_NM","VARIETY_NM","CORP_PDLT_NM"),
+    market: find("MARKET_NM","MKT_NM","WHSL_MKT_NM","MKTNM"),
+    high:   find("HIGH","HIGH_PRICE","CLRA_PRC_HIGH","MAX_PRICE","CLRC_HIGH"),
+    avg:    find("AVG","AVG_PRICE","CLRA_PRC_AVG","MEAN_PRICE","CLRC_AVG"),
+    low:    find("LOW","LOW_PRICE","CLRA_PRC_LOW","MIN_PRICE","CLRC_LOW"),
+    amt:    find("AMT","QNT","SALE_QNT","CLRC_QNT","AUCTION_CNT","QTY"),
+  };
+}
+
+function aggregate(rows, fruitName, marketId, keywords, dateLabel, dateFull, fieldMap) {
+  if (!rows.length) return null;
+  const fm = fieldMap ?? detectFields(rows[0]);
+
   const keep = rows.filter(r => {
-    const mid  = (r.MID_CLASS_NM ?? "").replace(/\s/g, "");
-    const corp = (r.CORP_ITEM_NM ?? r.SMALL_CLASS_NM ?? "").replace(/\s/g, "");
-    const mkt  = (r.MARKET_NM   ?? "").replace(/\s/g, "");
-    return (mid.includes(fruitName) || corp.includes(fruitName))
-        && (mkt.includes(marketId.replace(/\s/g,"")) || marketId === "전체")
-        && (keywords.length === 0 || keywords.some(k => corp.includes(k)));
+    const mid  = (fm.mid    ? r[fm.mid]    ?? "" : "").replace(/\s/g,"");
+    const corp = (fm.corp   ? r[fm.corp]   ?? "" : "").replace(/\s/g,"");
+    const mkt  = (fm.market ? r[fm.market] ?? "" : "").replace(/\s/g,"");
+    const fruitOk  = mid.includes(fruitName) || corp.includes(fruitName);
+    const marketOk = !fm.market || mkt.includes(marketId.replace(/\s/g,"")) || marketId === "전체";
+    const varOk    = keywords.length === 0 || keywords.some(k => corp.includes(k));
+    return fruitOk && marketOk && varOk;
   });
   if (!keep.length) return null;
-  const highs = keep.map(r => parseFloat(r.HIGH ?? r.AVG ?? 0)).filter(v => v > 0).sort((a,b) => b-a);
-  const avgs  = keep.map(r => parseFloat(r.AVG  ?? 0)).filter(v => v > 0);
-  const qtys  = keep.map(r => parseFloat(r.AMT  ?? r.AUCTION_CNT ?? 0));
+
+  const highs = keep.map(r => parseFloat(fm.high ? r[fm.high] : 0)).filter(v => v > 0).sort((a,b)=>b-a);
+  const avgs  = keep.map(r => parseFloat(fm.avg  ? r[fm.avg]  : 0)).filter(v => v > 0);
+  const qtys  = keep.map(r => parseFloat(fm.amt  ? r[fm.amt]  : 0)).filter(v => v >= 0);
   if (!highs.length) return null;
+
   return {
     date: dateLabel, fullDate: dateFull,
     maxPrice: highs[0],
     top15:    highs[Math.max(0, Math.ceil(highs.length * 0.15) - 1)],
     avgPrice: avgs.length ? Math.round(avgs.reduce((s,v)=>s+v,0)/avgs.length) : highs[0],
-    qty:      Math.max(0, qtys.reduce((s,v)=>s+v, 0)) || keep.length,
+    qty:      Math.max(0, qtys.reduce((s,v)=>s+v,0)) || keep.length,
   };
 }
 
@@ -123,13 +154,9 @@ function makeSim(fruit,variety,dates){
   });
 }
 
-/* ═══════════════════════════════════════════════════
-   유틸
-═══════════════════════════════════════════════════ */
 const won=v=>`₩${Math.round(Number(v)||0).toLocaleString()}`;
 const num=v=>Math.round(Number(v)||0).toLocaleString();
 const TC=t=>({전체:"#475569",대표품종:"#34d399",프리미엄:"#fbbf24",최고급:"#f59e0b",고급브랜드:"#fbbf24",희귀품종:"#c084fc",수입:"#94a3b8",국내산:"#f87171"}[t]||"#38bdf8");
-
 const PT=({active,payload,label})=>!active||!payload?.length?null:(
   <div style={{background:"#0c1830",border:"1px solid #1e3a5f",borderRadius:8,padding:"10px 14px",fontSize:12,boxShadow:"0 8px 32px rgba(0,0,0,.5)"}}>
     <p style={{color:"#94a3b8",marginBottom:6,fontWeight:600}}>{label}</p>
@@ -142,14 +169,14 @@ const QT=({active,payload,label})=>!active||!payload?.length?null:(
   </div>);
 
 /* ═══════════════════════════════════════════════════
-   메인 컴포넌트
+   메인
 ═══════════════════════════════════════════════════ */
 export default function App() {
-  const [fruit,   setFruit]   = useState("사과");
-  const [variety, setVariety] = useState("전체");
-  const [market,  setMarket]  = useState("가락시장");
-  const [period,  setPeriod]  = useState(PERIODS[0]);
-  const [tab,     setTab]     = useState("price");
+  const [fruit,    setFruit]    = useState("사과");
+  const [variety,  setVariety]  = useState("전체");
+  const [market,   setMarket]   = useState("가락시장");
+  const [period,   setPeriod]   = useState(PERIODS[0]);
+  const [tab,      setTab]      = useState("price");
 
   const [data,      setData]      = useState([]);
   const [apiMode,   setApiMode]   = useState("sim");
@@ -158,8 +185,15 @@ export default function App() {
   const [log,       setLog]       = useState([]);
   const [activeSvc, setActiveSvc] = useState("");
   const [apiKeyErr, setApiKeyErr] = useState(false);
-  const [now,       setNow]       = useState(new Date());
   const [foundSvc,  setFoundSvc]  = useState(null);
+  const [fieldMap,  setFieldMap]  = useState(null);
+  const [now,       setNow]       = useState(new Date());
+
+  // 디버그 패널
+  const [debugOpen,   setDebugOpen]   = useState(false);
+  const [debugSvc,    setDebugSvc]    = useState(SERVICE_CANDIDATES[0]);
+  const [debugResult, setDebugResult] = useState(null);
+  const [debugging,   setDebugging]   = useState(false);
 
   const abortRef = useRef(null);
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
@@ -169,10 +203,7 @@ export default function App() {
   const fruitInfo  = FRUITS.find(f=>f.id===fruit);
   const marketObj  = MARKETS.find(m=>m.id===market)||MARKETS[0];
 
-  // 서비스명 자동탐색
-  useEffect(() => {
-    fetchCatalog().then(nm => { if (nm) setFoundSvc(nm); }).catch(() => {});
-  }, []);
+  useEffect(()=>{fetchCatalog().then(nm=>{if(nm)setFoundSvc(nm);}).catch(()=>{});},[]);
 
   const loadData = useCallback(async () => {
     if (abortRef.current) abortRef.current.abort();
@@ -181,34 +212,51 @@ export default function App() {
     const dates = buildDates(period.days);
 
     setLoading(true); setLog([]); setProgress(0); setActiveSvc(""); setApiKeyErr(false);
-    const addLog = msg => setLog(prev => [...prev, msg]);
+    const addLog = msg => setLog(prev=>[...prev, msg]);
     addLog(`📅 ${dates.length}일 · ${fruit} ${variety} · ${marketObj.label}`);
 
-    const candidates = [foundSvc, ...SERVICE_CANDIDATES].filter(Boolean).filter((v,i,a)=>a.indexOf(v)===i);
-    const rows = []; let usedSvc = "";
+    const candidates = [foundSvc,...SERVICE_CANDIDATES].filter(Boolean).filter((v,i,a)=>a.indexOf(v)===i);
+    const rows = []; let usedSvc = ""; let detectedFm = null;
 
     outer: for (const svc of candidates) {
       addLog(`🔄 서비스명: ${svc}`);
-      let errCnt = 0;
+      let errCnt = 0; let dayRows0 = null;
+
       for (let i = 0; i < dates.length; i++) {
         if (signal.aborted) break outer;
-        setProgress(Math.round((i / dates.length) * 100));
+        setProgress(Math.round((i/dates.length)*100));
         try {
           const dayRows = await fetchAuction(svc, dates[i].ymd, signal);
-          if (!usedSvc) { usedSvc = svc; setActiveSvc(svc); }
+          // 첫 번째 데이터로 필드맵 자동 감지
+          if (!detectedFm && dayRows.length > 0) {
+            detectedFm = detectFields(dayRows[0]);
+            setFieldMap(detectedFm);
+            addLog(`🔍 감지된 필드: ${Object.entries(detectedFm).filter(([,v])=>v).map(([k,v])=>`${k}=${v}`).join(", ")}`);
+            dayRows0 = dayRows;
+          }
+          if (!usedSvc && dayRows.length > 0) { usedSvc = svc; setActiveSvc(svc); }
           const kw  = varietyObj?.kw ?? [];
-          const row = aggregate(dayRows, fruit, market, kw, dates[i].label, dates[i].full);
+          const row = aggregate(dayRows, fruit, market, kw, dates[i].label, dates[i].full, detectedFm);
           if (row) rows.push(row);
           errCnt = 0;
         } catch (e) {
           if (signal.aborted) break outer;
-          if (e.apiKeyMissing) { setApiKeyErr(true); addLog("❌ SEOUL_API_KEY 환경변수 미설정"); break outer; }
+          if (e.apiKeyMissing) { setApiKeyErr(true); addLog("❌ SEOUL_API_KEY 미설정"); break outer; }
           if (e.apiError)      { addLog(`❌ API 오류(${svc}): ${e.message.slice(0,80)}`); break; }
           errCnt++;
           if (errCnt >= 3)     { addLog(`❌ 연속 실패 → 다음 서비스명`); break; }
         }
       }
       if (rows.length > 0) break outer;
+
+      // 데이터를 받긴 했지만 과일 필터링이 0건인 경우 → 필드명 문제 가능성
+      if (dayRows0 && rows.length === 0) {
+        addLog(`⚠ ${svc}: 응답 있음(${dayRows0.length}건) 그러나 '${fruit}' 필터링 0건`);
+        addLog(`   → 실제 품목 표현: ${[...new Set(dayRows0.slice(0,5).map(r=>detectedFm?.mid?r[detectedFm.mid]:"?"))].join(", ")}`);
+        addLog(`   → 아래 '🔍 API 응답 진단' 버튼으로 원본 확인 후 문의하세요`);
+        usedSvc = svc; setActiveSvc(svc);
+        break outer; // 서비스명은 맞으니 더 시도 불필요
+      }
     }
 
     setProgress(100);
@@ -223,10 +271,22 @@ export default function App() {
     setLoading(false);
   }, [fruit, variety, period, market, foundSvc, varietyObj]);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(()=>{loadData();},[loadData]);
 
-  const stats = useMemo(() => {
-    if (!data.length) return {};
+  // 디버그 실행
+  const runDebug = async () => {
+    setDebugging(true); setDebugResult(null);
+    try {
+      const result = await fetchDebug(debugSvc, null);
+      setDebugResult(result);
+    } catch(e) {
+      setDebugResult({ error: e.message });
+    }
+    setDebugging(false);
+  };
+
+  const stats = useMemo(()=>{
+    if(!data.length)return{};
     const ma=data.map(d=>d.maxPrice),t15=data.map(d=>d.top15),qa=data.map(d=>d.qty);
     return{maxHigh:Math.max(...ma),maxLow:Math.min(...ma),maxAvg:Math.round(ma.reduce((a,b)=>a+b,0)/ma.length),
       t15High:Math.max(...t15),t15Low:Math.min(...t15),t15Avg:Math.round(t15.reduce((a,b)=>a+b,0)/t15.length),
@@ -251,7 +311,7 @@ export default function App() {
           <span style={{fontSize:24}}>🏪</span>
           <div>
             <div style={{fontSize:17,fontWeight:800,color:"#f0fdf4",letterSpacing:-0.5}}>청과 경매 정보 시스템</div>
-            <div style={{fontSize:9,color:"#64748b",letterSpacing:1.5,textTransform:"uppercase"}}>서울 열린데이터광장 OA-2662 · Vercel 서버리스 프록시</div>
+            <div style={{fontSize:9,color:"#64748b",letterSpacing:1.5,textTransform:"uppercase"}}>서울 열린데이터광장 OA-2662 · Vercel</div>
           </div>
         </div>
         <div style={{display:"flex",gap:7,alignItems:"center",flexWrap:"wrap"}}>
@@ -263,15 +323,15 @@ export default function App() {
       </div>
 
       {/* API 키 미설정 경고 */}
-      {apiKeyErr && (
+      {apiKeyErr&&(
         <div style={{background:"#450a0a",borderBottom:"1px solid #b91c1c",padding:"12px 24px",fontSize:12,color:"#f87171"}}>
-          ⚠ <strong>SEOUL_API_KEY 환경변수가 설정되지 않았습니다.</strong>
-          <span style={{color:"#94a3b8",marginLeft:8}}>Vercel Dashboard → Settings → Environment Variables에 추가하세요.</span>
+          ⚠ <strong>SEOUL_API_KEY 환경변수 미설정</strong>
+          <span style={{color:"#94a3b8",marginLeft:8}}>Vercel Dashboard → Settings → Environment Variables</span>
         </div>
       )}
 
       {/* 로딩 바 */}
-      {loading && (
+      {loading&&(
         <div style={{background:"#0c1e38",borderBottom:"1px solid #1a3a60",padding:"7px 24px"}}>
           <div style={{maxWidth:960,margin:"0 auto"}}>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:3,fontSize:11,color:"#64748b"}}>
@@ -318,7 +378,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* 현재 선택 요약 */}
+        {/* 현재 선택 */}
         <div style={{background:"linear-gradient(90deg,#0f2d4a,#0c1830)",border:"1px solid #1a3a60",borderRadius:10,padding:"12px 18px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             <span style={{fontSize:30}}>{fruitInfo?.emoji}</span>
@@ -395,9 +455,7 @@ export default function App() {
         {/* 수량 차트 */}
         {tab==="qty"&&(
           <div style={CARD}>
-            <div style={{fontSize:12,color:"#94a3b8",marginBottom:12,fontWeight:600}}>
-              {fruit} · {variety} 경매 수량 — {marketObj.label} ({period.label})
-            </div>
+            <div style={{fontSize:12,color:"#94a3b8",marginBottom:12,fontWeight:600}}>{fruit} · {variety} 경매 수량 — {marketObj.label} ({period.label})</div>
             <ResponsiveContainer width="100%" height={290}>
               <BarChart data={data} margin={{top:8,right:20,left:10,bottom:8}}>
                 <defs><linearGradient id="bG" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.9}/><stop offset="100%" stopColor="#0284c7" stopOpacity={0.5}/></linearGradient></defs>
@@ -414,9 +472,7 @@ export default function App() {
         {/* 데이터 표 */}
         {tab==="table"&&(
           <div style={CARD}>
-            <div style={{fontSize:12,color:"#94a3b8",marginBottom:12,fontWeight:600}}>
-              {fruit} · {variety} 일별 경매 데이터 — {marketObj.label} ({period.label})
-            </div>
+            <div style={{fontSize:12,color:"#94a3b8",marginBottom:12,fontWeight:600}}>{fruit} · {variety} 일별 경매 데이터 — {marketObj.label} ({period.label})</div>
             <div style={{overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
                 <thead><tr style={{background:"#0a1628"}}>{["날짜","경매 최고가","상위 15%","평균 낙찰가","전일比","경매 수량"].map(h=><th key={h} style={{padding:"8px 12px",textAlign:"left",color:"#475569",fontWeight:600,fontSize:9,letterSpacing:1,textTransform:"uppercase",borderBottom:"1px solid #1a3a60"}}>{h}</th>)}</tr></thead>
@@ -442,15 +498,72 @@ export default function App() {
 
         {/* 진단 로그 */}
         {log.length > 0 && (
-          <details style={{marginTop:12}}>
-            <summary style={{fontSize:11,color:"#475569",cursor:"pointer",userSelect:"none"}}>📋 진단 로그</summary>
-            <div style={{background:"#020b18",border:"1px solid #1a3a60",borderRadius:8,padding:"10px 13px",maxHeight:160,overflowY:"auto",marginTop:6}}>
-              {log.map((l,i)=>(
-                <div key={i} style={{fontSize:11,lineHeight:1.8,color:l.startsWith("✅")?"#34d399":l.startsWith("❌")?"#f87171":l.startsWith("⚠")?"#fbbf24":"#94a3b8"}}>{l}</div>
-              ))}
-            </div>
-          </details>
+          <div style={{marginTop:12,background:"#020b18",border:"1px solid #1a3a60",borderRadius:8,padding:"10px 13px",maxHeight:180,overflowY:"auto"}}>
+            <div style={{fontSize:9,color:"#475569",letterSpacing:2,textTransform:"uppercase",marginBottom:6}}>진단 로그</div>
+            {log.map((l,i)=>(
+              <div key={i} style={{fontSize:11,lineHeight:1.9,color:l.startsWith("✅")?"#34d399":l.startsWith("❌")?"#f87171":l.startsWith("⚠")||l.startsWith("   →")?"#fbbf24":"#94a3b8",fontFamily:l.startsWith("   →")?"monospace":"inherit"}}>{l}</div>
+            ))}
+          </div>
         )}
+
+        {/* API 응답 진단 패널 */}
+        <div style={{marginTop:10,background:"#0a1628",border:"1px solid #1a3a60",borderRadius:10,overflow:"hidden"}}>
+          <button onClick={()=>setDebugOpen(o=>!o)} style={{width:"100%",background:"none",border:"none",padding:"10px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontSize:11,color:"#38bdf8",fontWeight:600}}>🔍 API 응답 진단 (서비스명·필드명 확인)</span>
+            <span style={{fontSize:10,color:"#475569"}}>{debugOpen?"▲":"▼"}</span>
+          </button>
+          {debugOpen&&(
+            <div style={{padding:"0 14px 14px"}}>
+              <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
+                <select value={debugSvc} onChange={e=>setDebugSvc(e.target.value)}
+                  style={{background:"#0c1830",border:"1px solid #1a3a60",borderRadius:6,padding:"6px 10px",color:"#e2e8f0",fontSize:12,fontFamily:"monospace"}}>
+                  {SERVICE_CANDIDATES.map(s=><option key={s} value={s}>{s}</option>)}
+                </select>
+                <button onClick={runDebug} disabled={debugging} style={{background:"#0284c7",border:"none",borderRadius:6,padding:"7px 16px",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                  {debugging?"조회 중…":"오늘 데이터 조회"}
+                </button>
+                <span style={{fontSize:10,color:"#475569"}}>실제 API 응답의 topKey·필드명·샘플 데이터를 반환합니다</span>
+              </div>
+              {debugResult&&(
+                <div style={{background:"#020b18",border:"1px solid #1a3a60",borderRadius:8,padding:"12px"}}>
+                  {debugResult.error
+                    ? <div style={{color:"#f87171",fontSize:11}}>{debugResult.error}</div>
+                    : <>
+                        <div style={{fontSize:11,color:"#34d399",marginBottom:6}}>
+                          topKey: <code style={{color:"#7dd3fc"}}>{debugResult.topKey}</code> ·
+                          rows: <code style={{color:"#fbbf24"}}>{debugResult.rowCount}</code>건 ·
+                          result: <code style={{color:"#94a3b8"}}>{JSON.stringify(debugResult.result)}</code>
+                        </div>
+                        {debugResult.allFieldNames?.length > 0 && (
+                          <div style={{marginBottom:8}}>
+                            <div style={{fontSize:9,color:"#475569",letterSpacing:1.5,textTransform:"uppercase",marginBottom:4}}>응답 필드명</div>
+                            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                              {debugResult.allFieldNames.map(k=>(
+                                <code key={k} style={{background:"#0c1830",border:"1px solid #1a3a60",borderRadius:4,padding:"2px 7px",fontSize:10,color:"#94a3b8"}}>{k}</code>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {debugResult.sampleRows?.length > 0 && (
+                          <details>
+                            <summary style={{fontSize:10,color:"#475569",cursor:"pointer",marginBottom:4}}>샘플 데이터 (첫 2건)</summary>
+                            <pre style={{fontSize:10,color:"#64748b",overflowX:"auto",lineHeight:1.6,marginTop:6,whiteSpace:"pre-wrap"}}>
+                              {JSON.stringify(debugResult.sampleRows, null, 2)}
+                            </pre>
+                          </details>
+                        )}
+                        {debugResult.rowCount === 0 && (
+                          <div style={{color:"#fbbf24",fontSize:11,marginTop:4}}>
+                            ⚠ 오늘 데이터가 없습니다. 평일 낮 12시 이후 갱신되며, 주말·공휴일은 데이터 없을 수 있습니다.
+                          </div>
+                        )}
+                      </>
+                  }
+                </div>
+              )}
+            </div>
+          )}
+        </div>
 
         <div style={{marginTop:11,padding:"8px 12px",background:"#0a1628",border:"1px solid #1a3a60",borderRadius:8,fontSize:10,color:"#475569",lineHeight:1.6}}>
           <span style={{color:"#fbbf24"}}>ℹ </span>OA-2662 · 갱신 월~토 낮 12시 · 공공누리 1유형 · 저작권 서울시농수산식품공사
